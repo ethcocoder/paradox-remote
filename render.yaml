@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: paradox-signaling-server
+    env: node
+    plan: free # Use the free tier
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: PORT
+        value: 8080 # Default for our code, but Render will override
+      - key: NODE_ENV
+        value: production
