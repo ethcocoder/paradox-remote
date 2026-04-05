@@ -10,8 +10,18 @@ app.use(cors());
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-let streamer = null;
+const streamers = new Map(); // Store multiple devices: Map<deviceId, { ws, info }>
 let controller = null;
+
+// Helper to broadcast active devices to the controller
+const broadcastDeviceList = () => {
+  if (!controller) return;
+  const deviceList = Array.from(streamers.entries()).map(([id, data]) => ({
+    id,
+    ...data.info
+  }));
+  controller.send(JSON.stringify({ type: 'device-list', devices: deviceList }));
+};
 
 // Dashboard Landing Page
 app.get('/', (req, res) => {
@@ -22,8 +32,8 @@ app.get('/', (req, res) => {
           <h1 style="background: linear-gradient(45deg, #00e5ff, #007acc); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 30px;">Paradox Engine Status</h1>
           <div style="display: flex; gap: 20px; justify-content: center;">
             <div style="padding: 20px; background: rgba(255,255,255,0.03); border-radius: 12px; border: 1px solid #444;">
-              <div style="width: 12px; height: 12px; border-radius: 50%; background: ${streamer ? '#00ffcc' : '#ff3366'}; display: inline-block; box-shadow: 0 0 10px ${streamer ? '#00ffcc' : '#ff3366'};"></div>
-              <p style="margin-top: 10px;">Mobile Streamer</p>
+              <div style="width: 12px; height: 12px; border-radius: 50%; background: ${streamers.size > 0 ? '#00ffcc' : '#ff3366'}; display: inline-block; box-shadow: 0 0 10px ${streamers.size > 0 ? '#00ffcc' : '#ff3366'};"></div>
+              <p style="margin-top: 10px;">Mobile Streamers: ${streamers.size}</p>
             </div>
             <div style="padding: 20px; background: rgba(255,255,255,0.03); border-radius: 12px; border: 1px solid #444;">
               <div style="width: 12px; height: 12px; border-radius: 50%; background: ${controller ? '#00ffcc' : '#ff3366'}; display: inline-block; box-shadow: 0 0 10px ${controller ? '#00ffcc' : '#ff3366'};"></div>
@@ -43,50 +53,45 @@ wss.on('connection', (ws) => {
   ws.on('message', (messageAsString) => {
     try {
       const message = JSON.parse(messageAsString);
-      console.log('Received message type:', message.type);
 
       switch (message.type) {
         case 'register':
           if (message.role === 'streamer') {
-            streamer = ws;
-            console.log('Streamer registered.');
+            const deviceId = message.device.id;
+            streamers.set(deviceId, { ws, info: message.device });
+            ws.deviceId = deviceId; // attach ID to socket for disconnect tracking
+            console.log('Streamer registered:', deviceId);
             ws.send(JSON.stringify({ type: 'registered', role: 'streamer' }));
-            if (controller) {
-              controller.send(JSON.stringify({ type: 'streamer-ready' }));
-            }
+            broadcastDeviceList();
           } else if (message.role === 'controller') {
             controller = ws;
             console.log('Controller registered.');
             ws.send(JSON.stringify({ type: 'registered', role: 'controller' }));
-            if (streamer) {
-              ws.send(JSON.stringify({ type: 'streamer-ready' }));
-            }
+            broadcastDeviceList();
           }
           break;
 
         case 'offer':
-          // Controller sends offer to Streamer
-          if (streamer) {
-            console.log('Relaying offer to streamer');
-            streamer.send(JSON.stringify({ type: 'offer', offer: message.offer }));
+          // Controller sends offer to specific Streamer target
+          if (message.targetId && streamers.has(message.targetId)) {
+            console.log('Relaying offer to streamer:', message.targetId);
+            streamers.get(message.targetId).ws.send(JSON.stringify({ type: 'offer', offer: message.offer }));
           }
           break;
 
         case 'answer':
           // Streamer sends answer to Controller
           if (controller) {
-            console.log('Relaying answer to controller');
+            console.log('Relaying answer to controller from', ws.deviceId);
             controller.send(JSON.stringify({ type: 'answer', answer: message.answer }));
           }
           break;
 
         case 'ice-candidate':
           // Relay ICE candidates
-          if (message.target === 'streamer' && streamer) {
-            console.log('Relaying ice-candidate to streamer');
-            streamer.send(JSON.stringify({ type: 'ice-candidate', candidate: message.candidate }));
+          if (message.target === 'streamer' && message.targetId && streamers.has(message.targetId)) {
+            streamers.get(message.targetId).ws.send(JSON.stringify({ type: 'ice-candidate', candidate: message.candidate }));
           } else if (message.target === 'controller' && controller) {
-            console.log('Relaying ice-candidate to controller');
             controller.send(JSON.stringify({ type: 'ice-candidate', candidate: message.candidate }));
           }
           break;
@@ -101,10 +106,10 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     console.log('Client disconnected');
-    if (ws === streamer) {
-      streamer = null;
-      console.log('Streamer disconnected');
-      if (controller) controller.send(JSON.stringify({ type: 'streamer-disconnected' }));
+    if (ws.deviceId && streamers.has(ws.deviceId)) {
+      streamers.delete(ws.deviceId);
+      console.log('Streamer disconnected:', ws.deviceId);
+      broadcastDeviceList();
     } else if (ws === controller) {
       controller = null;
       console.log('Controller disconnected');
