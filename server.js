@@ -120,4 +120,13 @@ wss.on('connection', (ws) => {
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`Signaling server running on port ${PORT}`);
+  
+  // Heartbeat to prevent Render from killing the connection
+  setInterval(() => {
+    wss.clients.forEach((ws) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.ping();
+      }
+    });
+  }, 30000); 
 });
