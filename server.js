@@ -10,18 +10,22 @@ app.use(cors());
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const streamers = new Map(); // Store multiple devices: Map<deviceId, { ws, info }>
-let controller = null;
+const streamers = new Map();   // Map<deviceId, { ws, info }>
+const controllers = new Map(); // Map<socketId, ws>
+let nextId = 0;
 
-// Helper to broadcast active devices to the controller
 const broadcastDeviceList = () => {
-  if (!controller) return;
   const deviceList = Array.from(streamers.entries()).map(([id, data]) => ({
     id,
     ...data.info
   }));
-  controller.send(JSON.stringify({ type: 'device-list', devices: deviceList }));
+  controllers.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'device-list', devices: deviceList }));
+    }
+  });
 };
+
 
 // Dashboard Landing Page
 app.get('/', (req, res) => {
@@ -48,7 +52,8 @@ app.get('/', (req, res) => {
 });
 
 wss.on('connection', (ws) => {
-  console.log('Client connected');
+  const socketId = `node_${++nextId}`;
+  console.log('New connection:', socketId);
 
   ws.on('message', (messageAsString) => {
     try {
@@ -58,64 +63,60 @@ wss.on('connection', (ws) => {
         case 'register':
           if (message.role === 'streamer') {
             const deviceId = message.device.id;
+            // Flush Zombie connection
+            if (streamers.has(deviceId)) {
+              console.log('Refreshing connection for:', deviceId);
+              streamers.get(deviceId).ws.close();
+            }
             streamers.set(deviceId, { ws, info: message.device });
-            ws.deviceId = deviceId; // attach ID to socket for disconnect tracking
-            console.log('Streamer registered:', deviceId);
-            ws.send(JSON.stringify({ type: 'registered', role: 'streamer' }));
+            ws.deviceId = deviceId;
+            ws.role = 'streamer';
             broadcastDeviceList();
           } else if (message.role === 'controller') {
-            controller = ws;
-            console.log('Controller registered.');
-            ws.send(JSON.stringify({ type: 'registered', role: 'controller' }));
+            controllers.set(socketId, ws);
+            ws.role = 'controller';
             broadcastDeviceList();
           }
           break;
 
         case 'offer':
-          // Controller sends offer to specific Streamer target
           if (message.targetId && streamers.has(message.targetId)) {
-            console.log('Relaying offer to streamer:', message.targetId);
-            streamers.get(message.targetId).ws.send(JSON.stringify({ type: 'offer', offer: message.offer }));
+            streamers.get(message.targetId).ws.send(JSON.stringify({ 
+               type: 'offer', 
+               offer: message.offer, 
+               controllerId: socketId 
+            }));
           }
           break;
 
         case 'answer':
-          // Streamer sends answer to Controller
-          if (controller) {
-            console.log('Relaying answer to controller from', ws.deviceId);
-            controller.send(JSON.stringify({ type: 'answer', answer: message.answer }));
+          if (message.controllerId && controllers.has(message.controllerId)) {
+            controllers.get(message.controllerId).send(JSON.stringify({ 
+               type: 'answer', 
+               answer: message.answer 
+            }));
           }
           break;
 
         case 'ice-candidate':
-          // Relay ICE candidates
           if (message.target === 'streamer' && message.targetId && streamers.has(message.targetId)) {
             streamers.get(message.targetId).ws.send(JSON.stringify({ type: 'ice-candidate', candidate: message.candidate }));
-          } else if (message.target === 'controller' && controller) {
-            controller.send(JSON.stringify({ type: 'ice-candidate', candidate: message.candidate }));
+          } else if (message.target === 'controller' && message.controllerId && controllers.has(message.controllerId)) {
+            controllers.get(message.controllerId).send(JSON.stringify({ type: 'ice-candidate', candidate: message.candidate }));
           }
-          break;
 
-        default:
-          console.log('Unknown message type:', message.type);
+          break;
       }
-    } catch (err) {
-      console.error('Error parsing message', err);
-    }
+    } catch (err) { console.error(err); }
   });
 
   ws.on('close', () => {
-    console.log('Client disconnected');
-    if (ws.deviceId && streamers.has(ws.deviceId)) {
-      streamers.delete(ws.deviceId);
-      console.log('Streamer disconnected:', ws.deviceId);
-      broadcastDeviceList();
-    } else if (ws === controller) {
-      controller = null;
-      console.log('Controller disconnected');
-    }
+    if (ws.role === 'streamer') streamers.delete(ws.deviceId);
+    else controllers.delete(socketId);
+    broadcastDeviceList();
   });
 });
+
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
